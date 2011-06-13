@@ -1,0 +1,44 @@
+Expose iostat values via SNMP.
+
+In your net-snmp'd config file::
+
+  pass_persist .1.3.6.1.3.1 /path/to/snmp-iostat-bridge
+
+Optional arguments::
+
+  --base_oid <oid>  - Change the base oid to query against.
+  --interval <secs> - Interval in seconds to refresh iostat values.
+
+You can now query your OID subtree::
+
+  snmpwalk -c public -v1 localhost .1.3.6.1.3.1
+
+Values outputted will be coresponding to the iostat output, but with the index prepended:
+
+Linux::
+
+  Device: rrqm/s wrqm/s r/s  w/s   rkB/s  wkB/s  avgrq-sz avgqu-sz  await r_await w_await  svctm  %util
+  sda     1.00   18.34  3.67 42.98 247.61 306.37 23.75    0.04      0.80  4.16    0.51     0.52   2.42
+
+Solaris::
+
+  device    r/s    w/s   kr/s   kw/s wait actv  svc_t  %w  %b
+  sd0       0.0    0.2    0.0    1.5  0.0  0.0    4.3   0   0
+
+snmpwalk output::
+
+  .iso.3.6.1.3.1.1.1 = STRING: "1"
+  .iso.3.6.1.3.1.2.1 = STRING: "sda"
+  .iso.3.6.1.3.1.3.1 = STRING: "1.00"
+  .iso.3.6.1.3.1.4.1 = STRING: "18.34"
+  .iso.3.6.1.3.1.5.1 = STRING: "3.67"
+  .iso.3.6.1.3.1.6.1 = STRING: "42.98"
+  .iso.3.6.1.3.1.7.1 = STRING: "247.61"
+  .iso.3.6.1.3.1.8.1 = STRING: "306.37"
+  .iso.3.6.1.3.1.9.1 = STRING: "23.75"
+  .iso.3.6.1.3.1.10.1 = STRING: "0.04"
+  .iso.3.6.1.3.1.11.1 = STRING: "0.80"
+  .iso.3.6.1.3.1.12.1 = STRING: "4.16"
+  .iso.3.6.1.3.1.13.1 = STRING: "0.51"
+  .iso.3.6.1.3.1.14.1 = STRING: "0.52"
+  .iso.3.6.1.3.1.15.1 = STRING: "2.42"

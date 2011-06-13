@@ -1,0 +1,235 @@
+#!/usr/bin/python2.6 -u
+
+# snmp-iostat-bridge, Copyright (c) 2011 Dan Sully
+#
+# Author : Dan Sully <daniel-github at electricrain dot com>
+# License: MIT
+#
+# Python must be invoked with the -u switch for unbuffered I/O.
+
+"""
+  Expose iostat values via SNMP.
+
+  In your net-snmp'd config file::
+
+    pass_persist .1.3.6.1.3.1 /path/to/snmp-iostat-bridge
+
+  Optional arguments::
+
+    --base_oid <oid>  - Change the base oid to query against.
+    --interval <secs> - Interval in seconds to refresh iostat values.
+
+  You can now query your OID subtree::
+
+    snmpwalk -c public -v1 localhost .1.3.6.1.3.1
+
+  Values outputted will be coresponding to the iostat output, but with the index prepended:
+
+  Linux::
+
+    Device: rrqm/s wrqm/s r/s  w/s   rkB/s  wkB/s  avgrq-sz avgqu-sz  await r_await w_await  svctm  %util
+    sda     1.00   18.34  3.67 42.98 247.61 306.37 23.75    0.04      0.80  4.16    0.51     0.52   2.42
+
+  Solaris::
+
+    device    r/s    w/s   kr/s   kw/s wait actv  svc_t  %w  %b
+    sd0       0.0    0.2    0.0    1.5  0.0  0.0    4.3   0   0
+
+  snmpwalk output::
+
+    .iso.3.6.1.3.1.1.1 = STRING: "1"
+    .iso.3.6.1.3.1.2.1 = STRING: "sda"
+    .iso.3.6.1.3.1.3.1 = STRING: "1.00"
+    .iso.3.6.1.3.1.4.1 = STRING: "18.34"
+    .iso.3.6.1.3.1.5.1 = STRING: "3.67"
+    .iso.3.6.1.3.1.6.1 = STRING: "42.98"
+    .iso.3.6.1.3.1.7.1 = STRING: "247.61"
+    .iso.3.6.1.3.1.8.1 = STRING: "306.37"
+    .iso.3.6.1.3.1.9.1 = STRING: "23.75"
+    .iso.3.6.1.3.1.10.1 = STRING: "0.04"
+    .iso.3.6.1.3.1.11.1 = STRING: "0.80"
+    .iso.3.6.1.3.1.12.1 = STRING: "4.16"
+    .iso.3.6.1.3.1.13.1 = STRING: "0.51"
+    .iso.3.6.1.3.1.14.1 = STRING: "0.52"
+    .iso.3.6.1.3.1.15.1 = STRING: "2.42"
+"""
+
+import errno
+import optparse
+import platform
+import re
+import subprocess
+import sys
+import syslog
+import threading
+
+# This is the base OID that you set in snmpd.conf to respond to pass_persist
+DEFAULT_BASE_OID = '.1.3.6.1.3.1'
+
+# Default interval to pass to iostat.
+DEFAULT_INTERVAL  = 30
+
+class IOStats(object):
+
+  def __init__(self, base_oid, interval):
+
+    #: The base OID we should respond to.
+    self.base_oid = base_oid
+
+    #: Number of devices we've seen from iostat.
+    self.devices = 1
+
+    #: class:`dict` of iostats.
+    self.stats = {}
+
+    #: iostat command to run.
+    self.command = None
+
+    #: Threading lock for the stats data structure.
+    self.lock = threading.Lock()
+
+    #: Break out of the loop if snmp is shut down.
+    self.event = threading.Event()
+
+    if platform.system() == 'Linux':
+      self.command = ['/usr/bin/iostat', '-dxk', str(interval)]
+    elif platform.system() == 'SunOS':
+      self.command = ['/usr/bin/iostat', '-dx', str(interval)]
+    else:
+      syslog.syslog(syslog.LOG_ERR, "platform %s not supported, exiting..." % platform.system())
+
+      raise RuntimeError('Platform not supported: %s' % platform.system())
+
+  def updater(self):
+    """ Handle populating the stats dict. """
+
+    syslog.syslog(syslog.LOG_INFO, "Starting background iostat thread.")
+
+    popen = subprocess.Popen(self.command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    # Avoid the file iterator's internal buffering.
+    line = popen.stdout.readline()
+
+    while line:
+      if self.event.is_set():
+        break
+
+      line = line.strip()
+
+      with self.lock:
+        if re.match('^Device', line, re.IGNORECASE):
+
+          # Reset when we hit a new device line.
+          self.devices = 1
+
+        elif line and not line.startswith('Linux'):
+
+          # Linux:
+          # Device: rrqm/s wrqm/s r/s  w/s  rkB/s wkB/s avgrq-sz avgqu-sz await svctm %util
+          # sdc     0.00   0.00   0.00 0.00 0.00  0.00  0.00     0.00     0.00  0.00  0.00
+          #
+          # Solaris:
+          # device    r/s    w/s   kr/s   kw/s wait actv  svc_t  %w  %b
+          # sd0       0.0    0.2    0.0    1.5  0.0  0.0    4.3   0   0
+
+          stats = [self.devices]
+          stats.extend(re.compile('\s+').split(line))
+
+          for i, value in enumerate(stats):
+            self.stats["%s.%d.%d" % (self.base_oid, i+1, self.devices)] = value
+
+          self.devices += 1
+
+      line = popen.stdout.readline()
+
+  def get_oid(self, oid):
+    """ Grab the requested OID from the stats structure. """
+
+    match = re.match(self.base_oid + '\.(\d+)\.(\d+).*', oid)
+
+    if match:
+      with self.lock:
+        if oid in self.stats:
+          print oid
+          print 'string'
+          print self.stats[oid]
+          return
+
+    print 'NONE'
+
+  def get_next_oid(self, oid):
+    """ Calculate & return the next OID in the tree. """
+
+    match    = re.match(self.base_oid + '\.(\d+)\.(\d+)', oid)
+    next_oid = None
+
+    if match:
+      with self.lock:
+
+        if int(match.group(2)) + 1 >= self.devices:
+          count_id = int(match.group(1)) + 1
+          index    = 1
+        else:
+          count_id = int(match.group(1))
+          index    = int(match.group(2)) + 1
+
+      next_oid = '%s.%d.%d' % (self.base_oid, count_id, index)
+
+    if next_oid is None:
+      match = re.match(self.base_oid + '\.(\d+)', oid)
+
+      if match:
+        next_oid = '%s.%s.1' % (self.base_oid, match.group(1))
+
+    if next_oid is None:
+      next_oid = '%s.1.1' % self.base_oid
+
+    self.get_oid(next_oid)
+
+def main():
+
+  syslog.openlog(sys.argv[0], syslog.LOG_PID)
+
+  parser = optparse.OptionParser()
+  parser.add_option("--base_oid", dest="base_oid", help="Base OID to use for queries.", default=DEFAULT_BASE_OID)
+  parser.add_option("--interval", dest="interval", help="Interval for iostat refreshes.", default=DEFAULT_INTERVAL)
+  (options, args) = parser.parse_args()
+
+  iostats = IOStats(options.base_oid, options.interval)
+
+  updater = threading.Thread(name="iostat-updater", target=iostats.updater)
+  updater.start()
+
+  # See snmpd.conf(1) for a description of the pass_persist protocol.
+  while updater.is_alive():
+    try:
+      command = sys.stdin.readline().strip()
+
+      if 'PING' in command:
+        print 'PONG'
+        continue
+
+      oid = sys.stdin.readline().strip()
+
+      if 'getnext' in command:
+        iostats.get_next_oid(oid)
+
+      elif 'get' in command:
+        iostats.get_oid(oid)
+
+      else:
+        print 'NONE'
+
+    except Exception, e:
+      iostats.event.set()
+
+      if hasattr(e, 'errno') and e.errno == errno.EPIPE:
+        syslog.syslog(syslog.LOG_ERR, "snmpd had closed the pipe, exiting.")
+      else:
+        syslog.syslog(syslog.LOG_ERR, "Got unknown exception: %s" % e)
+
+      updater.join(1)
+      sys.exit(0)
+
+if __name__ == '__main__':
+  main()
